@@ -69,6 +69,10 @@ class simple_np_ds(Dataset):
         self.train_indices = indices[:-n_val-n_test]
         self.val_indices = indices[-n_test-n_val:-n_test]
         self.test_indices = indices[-n_test:]
+        print('length of the training indices: {}'.format(len(self.train_indices)))
+        print('length of the validation indices: {}'.format(len(self.val_indices)))
+        print('length of the test indices: {}'.format(len(self.test_indices)))
+        
         self.compute_scaling()
        
     def compute_scaling(self):
