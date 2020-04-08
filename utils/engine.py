@@ -55,8 +55,15 @@ class Engine:
         # Send the model to the selected device
         self.model.to(self.device)
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
-        #self.optimizer = optim.SGD(self.model.parameters(), lr=config.lr)
+        if config.optimizer=='Adam':
+            self.optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
+        elif config.optimizer=='SGD':
+            self.optimizer = optim.SGD(self.model.parameters(), lr=config.lr)
+        else:
+            raise ValueError('select optimizer explicitly by providing config.optimizer field\n'\
+                             'config.optimizer field is set to {}'.format(config.optimizer))
+            
+            
         self.criterion = nn.CrossEntropyLoss()
         self.softmax = nn.Softmax(dim=1)
 
@@ -88,7 +95,25 @@ class Engine:
                                   num_workers=config.num_workers_test)
 
         self.dirpath=config.dump_path + "/"+time.strftime("%Y%m%d_%H%M%S") + "/"
+        
+        self.len_train_dldr=len(self.train_dldr)
+        self.len_val_dldr=len(self.val_dldr)
+        self.len_test_dldr=len(self.test_dldr)
 
+        print('length of train dataloader: {}'.format(self.len_train_dldr))
+        print('length of validation dataloader: {}'.format(self.len_val_dldr))
+        print('length of test dataloader: {}'.format(self.len_test_dldr))
+        
+        if config.lr_scheduler is not None:
+            print('config.lr_scheduler is {}'.format(config.lr_scheduler))
+            if config.lr_scheduler=='SGDR':
+                print('SGDR learning schedule')
+                self.lr_schedule_period=int(config.lr_initial_period*self.len_train_dldr)
+                self.lr_scheduler=optim.lr_scheduler.CosineAnnealingLR(self.optimizer,self.lr_schedule_period)
+                self.lr_schedule_batches_since_restart=0
+            else:
+                raise NotImplementedError('{} scheduler is not implemented'.format(config.lr_scheduler))
+        
                 
         try:
             os.stat(self.dirpath)
@@ -135,7 +160,8 @@ class Engine:
         self.optimizer.zero_grad()  # Reset gradients accumulation
         self.loss.backward()
         self.optimizer.step()
-        
+                                          
+            
     # ========================================================================
     def train(self, epochs=3.0, report_interval=10, valid_interval=1000):
         # Based on WaTCHMaL workshop and W's code
@@ -203,22 +229,46 @@ class Engine:
                 res = self.forward(True)
                 # Call backward: backpropagate error and update weights
                 self.backward()
-                # Epoch update
-                epoch += 1./len(self.train_dldr)
-                self.iteration += 1
+                
                 
                 # Log/Report
-                #
+    
                 # Record the current performance on train set
-                self.train_log.record(['iteration','epoch','accuracy','loss'],[self.iteration,epoch,res['accuracy'],res['loss']])
+                if self.config.lr_scheduler is not None:
+                    self.train_log.record(['iteration','epoch','accuracy','loss','lr'],
+                                          [self.iteration,epoch,res['accuracy'],res['loss'],self.lr_scheduler.get_lr()[0]])
+                else:
+                    self.train_log.record(['iteration','epoch','accuracy','loss'],
+                                          [self.iteration,epoch,res['accuracy'],res['loss']])
+                #self.train_log.record(['iteration','epoch','accuracy','loss'],
+                #                      [self.iteration,epoch,res['accuracy'],res['loss']])
                 self.train_log.write()
                 self.train_log.flush()
                 
                 # once in a while, report
                 if i==0 or i%report_interval == 0:
-                    print('... Iteration %d ... Epoch %1.2f ... Loss %1.3f ... Accuracy %1.3f' % (self.iteration,epoch,res['loss'],res['accuracy']))
-                    pass
+                    if self.config.lr_scheduler is not None:
+                        print('... Iteration %d ... Epoch %1.2f ... Loss %1.3f ... Accuracy %1.3f ... LR %.3e' % (self.iteration,epoch,res['loss'],res['accuracy'],self.lr_scheduler.get_lr()[0]))
+                    else:
+                        print('... Iteration %d ... Epoch %1.2f ... Loss %1.3f ... Accuracy %1.3f' % (self.iteration,epoch,res['loss'],res['accuracy']))
                     
+                # Epoch update
+                epoch += 1./len(self.train_dldr)
+                self.iteration += 1
+                
+                #learning rate update if any
+                if self.config.lr_scheduler=='SGDR':
+                    if self.lr_schedule_batches_since_restart==self.lr_schedule_period:
+                        print('***************************************************')
+                        print('learning schedule restart!!')
+                        self.lr_schedule_period=int(self.lr_schedule_period/self.config.lr_schedule_division)
+                        print('upcoming cycle will be {} batches = {} epochs long'.format(self.lr_schedule_period,
+                                                                                          self.lr_schedule_period*self.len_train_dldr))
+                        self.lr_scheduler=optim.lr_scheduler.CosineAnnealingLR(self.optimizer,self.lr_schedule_period)
+                        self.lr_schedule_batches_since_restart=0
+                              
+                    self.lr_scheduler.step()
+                    self.lr_schedule_batches_since_restart+=1    
                 
                         
                 if epoch >= epochs:
@@ -310,11 +360,21 @@ class Engine:
         # Save parameters
         # 0+1) iteration counter + optimizer state => in case we want to "continue training" later
         # 2) network weight
-        torch.save({
-            'global_step': self.iteration,
-            'optimizer': self.optimizer.state_dict(),
-            'state_dict': self.model.state_dict()
-        }, filename)
+        if self.lr_scheduler is not None and self.config.lr_scheduler=='SGDR':
+            torch.save({
+                'global_step': self.iteration,
+                'lr_schedule_batches_since_restart': self.lr_schedule_batches_since_restart,
+                'lr_schedule_period': self.lr_schedule_period,
+                'lr_scheduler': self.lr_scheduler.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'state_dict': self.model.state_dict()
+            }, filename)
+        else:
+            torch.save({
+                'global_step': self.iteration,
+                'optimizer': self.optimizer.state_dict(),
+                'state_dict': self.model.state_dict()
+            }, filename)
         print('Saved checkpoint as:', filename)
         return filename
 
@@ -332,5 +392,12 @@ class Engine:
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
             # load iteration count
             self.iteration = checkpoint['global_step']
+            if self.lr_scheduler is not None:
+                if self.config.lr_scheduler=='SGDR' and self.config.lr_scheduler_restore:
+                    self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+                else:
+                    print("lr_scheduler is present but state not restored")
+                    print("config.lr_scheduler: {}, config.lr_scheduler_restore: {}".format(self.config.lr_scheduler,self.config.lr_scheduler_restore))
+            
         print('Restoration complete.')
             
